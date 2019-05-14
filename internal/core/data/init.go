@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edgexfoundry-holding/go-mod-core-security/pkg"
 	"github.com/edgexfoundry/go-mod-core-contracts/clients"
 	"github.com/edgexfoundry/go-mod-core-contracts/clients/logger"
 	"github.com/edgexfoundry/go-mod-core-contracts/clients/metadata"
@@ -47,6 +48,7 @@ var Configuration *ConfigurationStruct
 var dbClient interfaces.DBClient
 var LoggingClient logger.LoggingClient
 var registryClient registry.Client
+var secretsClient pkg.SecretClient
 
 // TODO: Refactor names in separate PR: See comments on PR #1133
 var chEvents chan interface{}  // A channel for "domain events" sourced from event operations
@@ -57,16 +59,16 @@ var msgClient messaging.MessageClient
 var mdc metadata.DeviceClient
 var msc metadata.DeviceServiceClient
 
-func Retry(useRegistry bool, useProfile string, timeout int, wait *sync.WaitGroup, ch chan error) {
-	until := time.Now().Add(time.Millisecond * time.Duration(timeout))
+func Retry(params startup.BootParams, wait *sync.WaitGroup, ch chan error) {
+	until := time.Now().Add(time.Millisecond * time.Duration(params.BootTimeout))
 	for time.Now().Before(until) {
 		var err error
 		// When looping, only handle configuration if it hasn't already been set.
 		if Configuration == nil {
-			Configuration, err = initializeConfiguration(useRegistry, useProfile)
+			Configuration, err = initializeConfiguration(params)
 			if err != nil {
 				ch <- err
-				if !useRegistry {
+				if !params.UseRegistry {
 					// Error occurred when attempting to read from local filesystem. Fail fast.
 					close(ch)
 					wait.Done()
@@ -78,7 +80,7 @@ func Retry(useRegistry bool, useProfile string, timeout int, wait *sync.WaitGrou
 				LoggingClient = logger.NewClient(clients.CoreDataServiceKey, Configuration.Logging.EnableRemote, logTarget, Configuration.Writable.LogLevel)
 
 				// Initialize service clients
-				initializeClients(useRegistry)
+				initializeClients(params.UseRegistry)
 			}
 		}
 
@@ -172,15 +174,15 @@ func newDBClient(dbType string) (interfaces.DBClient, error) {
 	}
 }
 
-func initializeConfiguration(useRegistry bool, useProfile string) (*ConfigurationStruct, error) {
+func initializeConfiguration(params startup.BootParams) (*ConfigurationStruct, error) {
 	// We currently have to load configuration from filesystem first in order to obtain Registry Host/Port
 	configuration := &ConfigurationStruct{}
-	err := config.LoadFromFile(useProfile, configuration)
+	err := config.LoadFromFile(params.UseProfile, configuration)
 	if err != nil {
 		return nil, err
 	}
 
-	if useRegistry {
+	if params.UseRegistry {
 		err = connectToRegistry(configuration)
 		if err != nil {
 			return nil, err
@@ -201,6 +203,34 @@ func initializeConfiguration(useRegistry bool, useProfile string) (*Configuratio
 		// Check that information was successfully read from Registry
 		if configuration.Service.Port == 0 {
 			return nil, errors.New("error reading configuration from Registry")
+		}
+	}
+
+	if !params.UseLocalSecrets {
+		var err error
+		secretsClient, err = pkg.NewSecretClient(configuration.Secrets)
+		if err != nil {
+			return nil, err
+		}
+
+		username, err := secretsClient.GetValue("coredata")
+		if err != nil {
+			return nil, err
+		}
+
+		password, err := secretsClient.GetValue("coredatapasswd")
+		if err != nil {
+			return nil, err
+		}
+
+		configuration.Databases["Primary"] = config.DatabaseInfo{
+			Type:     configuration.Databases["Primary"].Type,
+			Timeout:  configuration.Databases["Primary"].Timeout,
+			Host:     configuration.Databases["Primary"].Host,
+			Port:     configuration.Databases["Primary"].Port,
+			Username: username,
+			Password: password,
+			Name:     configuration.Databases["Primary"].Name,
 		}
 	}
 
